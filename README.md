@@ -34,14 +34,16 @@ Skills are similarly flat — every skill appears in the system prompt without p
 
 **pi-namespace** patches `ExtensionRunner.prototype.getAllRegisteredTools` — the single chokepoint where pi's `AgentSession` pulls tool definitions before they're frozen into the LLM schema, system prompt, and TUI.
 
-| Before | After |
-|--------|-------|
-| `push` | `deploy:push` |
-| `status` | `deploy:status` |
-| `search` | `msg:search` |
-| `read` | `fs:read` (with `builtinNamespace`) |
+| Before | After (default `:`) | After (`"separator": "__"`) |
+|--------|--------|--------|
+| `push` | `deploy:push` | `deploy__push` |
+| `status` | `deploy:status` | `deploy__status` |
+| `search` | `msg:search` | `msg__search` |
+| `read` | `fs:read` (with `builtinNamespace`) | `fs__read` |
 
 Namespaced names flow through to **everything**: LLM tool schemas, system prompt snippets, `setActiveTools()`, `--tools`, `--exclude-tools`, and the TUI.
+
+> **Tip:** Some LLM providers (notably Anthropic) reject colons in tool names. If you see `invalid_request_error: tools.X.custom.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'`, set `"separator": "__"` in your config to use underscores instead.
 
 ```
 Available tools
@@ -101,6 +103,7 @@ Create `~/.pi/agent/namespace.json` (global) or `.pi/namespace.json` (project):
     "pi-code-previews": "preview"
   },
   "builtinNamespace": "fs",
+  "separator": "__",
   "autoNamespace": false
 }
 ```
@@ -109,6 +112,7 @@ Create `~/.pi/agent/namespace.json` (global) or `.pi/namespace.json` (project):
 |--------|------|---------|-------------|
 | `namespaces` | `Record<string, string>` | `{}` | Map of extension `sourceInfo.path` (or substring) → namespace prefix |
 | `builtinNamespace` | `string` | — | Optional prefix for built-in tools (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`) |
+| `separator` | `string` | `":"` | Separator between prefix and tool name. Use `"__"` for providers that reject colons (e.g. Anthropic: `^[a-zA-Z0-9_-]{1,128}$`) |
 | `autoNamespace` | `boolean` | `false` | Auto-derive namespace from extension directory/package name |
 
 ### Namespace matching

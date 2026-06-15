@@ -43,6 +43,10 @@ export interface NamespaceConfig {
   builtinNamespace?: string;
   /** Automatically derive namespace from extension directory/package name when no explicit mapping exists */
   autoNamespace?: boolean;
+  /** Separator between namespace prefix and tool name. Default ":".
+   *  Use "__" for providers that reject colons in tool names
+   *  (e.g. Anthropic: ^[a-zA-Z0-9_-]{1,128}$). */
+  separator?: string;
 }
 
 const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
@@ -163,11 +167,12 @@ export function resolveNamespace(
  * "deploy" + "push" → "deploy:push"
  * Won't double-prefix: "deploy:push" + "deploy" → "deploy:push"
  */
-export function applyNamespace(prefix: string, name: string): string {
-  if (name.startsWith(`${prefix}:`)) {
+export function applyNamespace(prefix: string, name: string, separator: string = ":"): string {
+  const sep = separator;
+  if (name.startsWith(`${prefix}${sep}`)) {
     return name;
   }
-  return `${prefix}:${name}`;
+  return `${prefix}${sep}${name}`;
 }
 
 /**
@@ -178,12 +183,13 @@ export function applyNamespace(prefix: string, name: string): string {
 export function stripNamespace(
   namespacedName: string,
   nsMap: Map<string, string>,
+  separator: string = ":",
 ): string {
-  const colonIdx = namespacedName.indexOf(":");
-  if (colonIdx === -1) return namespacedName;
+  const sepIdx = namespacedName.indexOf(separator);
+  if (sepIdx === -1) return namespacedName;
 
-  const prefix = namespacedName.slice(0, colonIdx);
-  const original = namespacedName.slice(colonIdx + 1);
+  const prefix = namespacedName.slice(0, sepIdx);
+  const original = namespacedName.slice(sepIdx + separator.length);
 
   // Only strip if this prefix was one we added
   if (nsMap.has(prefix)) {
@@ -350,12 +356,54 @@ async function patchAgentSession(config: NamespaceConfig): Promise<boolean> {
   if (typeof originalRefresh !== "function") return false;
 
   Session.prototype._refreshToolRegistry = function (this: any, ...args: any[]) {
+    // Expand _allowedToolNames / _excludedToolNames so that namespaced forms
+    // (e.g. "fs:read") resolve to their originals ("read") for the
+    // isAllowedTool filter, which runs against pre-rewrite names.
+    // Both directions are added so the filter works at every stage.
+    expandAllowExcludeSets(this, config);
     originalRefresh.call(this, ...args);
     rewriteBuiltinTools(this, config);
   };
 
   sessionPatched = true;
   return true;
+}
+
+/**
+ * Expand _allowedToolNames and _excludedToolNames so that both the
+ * namespaced form ("fs:read") and the original form ("read") are present.
+ *
+ * This lets --tools fs:read / --exclude-tools fs:read work correctly
+ * even though the internal filter checks against pre-rewrite names.
+ */
+export function expandAllowExcludeSets(
+  session: any,
+  config: NamespaceConfig,
+): void {
+  if (!config.builtinNamespace) return;
+
+  const ns = config.builtinNamespace;
+  const sep = config.separator ?? ":";
+
+  for (const builtinName of BUILTIN_TOOLS) {
+    const namespacedName = applyNamespace(ns, builtinName, sep);
+
+    if (session._allowedToolNames) {
+      if (session._allowedToolNames.has(namespacedName)) {
+        session._allowedToolNames.add(builtinName);
+      } else if (session._allowedToolNames.has(builtinName)) {
+        session._allowedToolNames.add(namespacedName);
+      }
+    }
+
+    if (session._excludedToolNames) {
+      if (session._excludedToolNames.has(namespacedName)) {
+        session._excludedToolNames.add(builtinName);
+      } else if (session._excludedToolNames.has(builtinName)) {
+        session._excludedToolNames.add(namespacedName);
+      }
+    }
+  }
 }
 
 /**
@@ -374,6 +422,7 @@ export function rewriteBuiltinTools(session: any, config: NamespaceConfig): void
   if (!config.builtinNamespace) return;
 
   const ns = config.builtinNamespace;
+  const sep = config.separator ?? ":";
   const definitions: Map<string, any> = session._toolDefinitions;
   const snippets: Map<string, string> = session._toolPromptSnippets;
   const guidelinesMap: Map<string, string[]> = session._toolPromptGuidelines;
@@ -385,7 +434,7 @@ export function rewriteBuiltinTools(session: any, config: NamespaceConfig): void
   const renames: Array<{ from: string; to: string }> = [];
   for (const [name, entry] of definitions) {
     if (entry.sourceInfo?.source === "builtin" && BUILTIN_TOOLS.has(name)) {
-      const namespacedName = applyNamespace(ns, name);
+      const namespacedName = applyNamespace(ns, name, sep);
       if (namespacedName !== name) {
         renames.push({ from: name, to: namespacedName });
       }
@@ -491,7 +540,8 @@ export function rewriteTools(
 
     if (!ns) return tool;
 
-    const namespacedName = applyNamespace(ns, tool.definition.name);
+    const sep = config.separator ?? ":";
+    const namespacedName = applyNamespace(ns, tool.definition.name, sep);
 
     // Don't rewrite built-in tool overrides — those intentionally replace the
     // built-in by name. If the extension that provides the override has a
@@ -563,8 +613,9 @@ function rewriteSkillPrompt(systemPrompt: string, config: NamespaceConfig): stri
       `<skill name="(${escapeRegex(key)}[^"]*)"`,
       "g",
     );
+    const sep = config.separator ?? ":";
     result = result.replace(skillRegex, (_match, name) => {
-      const namespacedName = applyNamespace(ns, name);
+      const namespacedName = applyNamespace(ns, name, sep);
       return `<skill name="${namespacedName}"`;
     });
 
@@ -575,7 +626,7 @@ function rewriteSkillPrompt(systemPrompt: string, config: NamespaceConfig): stri
     );
     result = result.replace(skillCmdRegex, (_match, suffix) => {
       const originalName = key + suffix;
-      return `/skill:${applyNamespace(ns, originalName)}`;
+      return `/skill:${applyNamespace(ns, originalName, sep)}`;
     });
   }
 
@@ -591,28 +642,23 @@ export default async function namespaceExtension(pi: ExtensionAPI) {
   // Track the namespace map for reverse lookups (namespaced → original)
   const nsMap = new Map<string, string>();
 
+  // Apply prototype patches EAGERLY in the factory body (not in session_start).
+  // The factory runs during _buildRuntime, before _refreshToolRegistry is
+  // called for the first time. If we defer to session_start, the first
+  // _refreshToolRegistry call will use the unpatched prototype.
+  await patchExtensionRunner(config);
+  await patchAgentSession(config);
+
   // Build the map after tools are registered
   pi.on("session_start", async (_event, _ctx) => {
-    // Patch the runner if not already done
-    const runnerSuccess = await patchExtensionRunner(config);
-    if (!runnerSuccess) {
-      // Couldn't patch — likely running in an environment where the
-      // runner module isn't accessible (print mode, etc.)
-    }
-
-    // Patch the AgentSession if builtinNamespace is configured
-    const sessionSuccess = await patchAgentSession(config);
-    if (!sessionSuccess && config.builtinNamespace) {
-      // Couldn't patch — built-in tools won't be namespaced
-    }
-
     // Build the reverse namespace map from current tools
     const tools = pi.getAllTools();
+    const sep = config.separator ?? ":";
     nsMap.clear();
     for (const tool of tools) {
       const ns = resolveNamespace(tool, config);
       if (ns) {
-        const namespacedName = applyNamespace(ns, tool.name);
+        const namespacedName = applyNamespace(ns, tool.name, sep);
         nsMap.set(namespacedName, tool.name);
       }
     }
@@ -655,7 +701,7 @@ export default async function namespaceExtension(pi: ExtensionAPI) {
         const lines = tools.map((t) => {
           const ns = resolveNamespace(t, config);
           if (ns) {
-            const namespaced = applyNamespace(ns, t.name);
+            const namespaced = applyNamespace(ns, t.name, config.separator ?? ":");
             return `  ${t.name} → ${namespaced} (${t.sourceInfo.path})`;
           }
           return `  ${t.name} (no namespace, ${t.sourceInfo.source})`;
@@ -676,6 +722,9 @@ export default async function namespaceExtension(pi: ExtensionAPI) {
       ];
       if (config.builtinNamespace) {
         lines.push(`Built-in namespace: ${config.builtinNamespace}`);
+      }
+      if (config.separator && config.separator !== ":") {
+        lines.push(`Separator: ${config.separator}`);
       }
       if (config.autoNamespace) {
         lines.push("Auto-namespace: enabled");

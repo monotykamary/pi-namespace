@@ -10,6 +10,7 @@ import {
   stripNamespace,
   rewriteTools,
   rewriteBuiltinTools,
+  expandAllowExcludeSets,
 } from "../../namespace.js";
 import type { NamespaceConfig } from "../../namespace.js";
 
@@ -125,6 +126,14 @@ describe("applyNamespace", () => {
 
   it("works for built-in tools", () => {
     expect(applyNamespace("fs", "read")).toBe("fs:read");
+  });
+
+  it("supports custom separator", () => {
+    expect(applyNamespace("fs", "read", "__")).toBe("fs__read");
+  });
+
+  it("does not double-prefix with custom separator", () => {
+    expect(applyNamespace("deploy", "deploy__push", "__")).toBe("deploy__push");
   });
 });
 
@@ -448,5 +457,100 @@ describe("rewriteBuiltinTools", () => {
     expect(session._toolDefinitions.get("fs:read").definition.name).toBe(
       "fs:read",
     );
+  });
+});
+
+describe("expandAllowExcludeSets", () => {
+  it("adds original name when namespaced form is in allowedToolNames", () => {
+    const config: NamespaceConfig = { builtinNamespace: "fs" };
+    const session = {
+      _allowedToolNames: new Set(["fs:read", "deploy:push"]),
+      _excludedToolNames: undefined,
+    };
+
+    expandAllowExcludeSets(session, config);
+
+    expect(session._allowedToolNames.has("read")).toBe(true);
+    // Already-present namespaced form stays
+    expect(session._allowedToolNames.has("fs:read")).toBe(true);
+    // Unrelated names untouched
+    expect(session._allowedToolNames.has("deploy:push")).toBe(true);
+  });
+
+  it("adds namespaced form when original name is in allowedToolNames", () => {
+    const config: NamespaceConfig = { builtinNamespace: "fs" };
+    const session = {
+      _allowedToolNames: new Set(["read", "deploy:push"]),
+      _excludedToolNames: undefined,
+    };
+
+    expandAllowExcludeSets(session, config);
+
+    expect(session._allowedToolNames.has("fs:read")).toBe(true);
+    expect(session._allowedToolNames.has("read")).toBe(true);
+  });
+
+  it("adds original name when namespaced form is in excludedToolNames", () => {
+    const config: NamespaceConfig = { builtinNamespace: "fs" };
+    const session = {
+      _allowedToolNames: undefined,
+      _excludedToolNames: new Set(["fs:bash"]),
+    };
+
+    expandAllowExcludeSets(session, config);
+
+    expect(session._excludedToolNames.has("bash")).toBe(true);
+    expect(session._excludedToolNames.has("fs:bash")).toBe(true);
+  });
+
+  it("adds namespaced form when original name is in excludedToolNames", () => {
+    const config: NamespaceConfig = { builtinNamespace: "fs" };
+    const session = {
+      _allowedToolNames: undefined,
+      _excludedToolNames: new Set(["bash"]),
+    };
+
+    expandAllowExcludeSets(session, config);
+
+    expect(session._excludedToolNames.has("fs:bash")).toBe(true);
+    expect(session._excludedToolNames.has("bash")).toBe(true);
+  });
+
+  it("does nothing when builtinNamespace is not set", () => {
+    const config: NamespaceConfig = {};
+    const session = {
+      _allowedToolNames: new Set(["fs:read"]),
+      _excludedToolNames: new Set(["fs:bash"]),
+    };
+
+    expandAllowExcludeSets(session, config);
+
+    // No expansion happened
+    expect(session._allowedToolNames.has("read")).toBe(false);
+    expect(session._excludedToolNames.has("bash")).toBe(false);
+  });
+
+  it("does nothing when no allow/exclude sets exist", () => {
+    const config: NamespaceConfig = { builtinNamespace: "fs" };
+    const session = {
+      _allowedToolNames: undefined,
+      _excludedToolNames: undefined,
+    };
+
+    expect(() => expandAllowExcludeSets(session, config)).not.toThrow();
+  });
+
+  it("expands all built-in tools, not just the one specified", () => {
+    const config: NamespaceConfig = { builtinNamespace: "fs" };
+    const session = {
+      _allowedToolNames: new Set(["fs:read", "fs:bash", "fs:edit"]),
+      _excludedToolNames: undefined,
+    };
+
+    expandAllowExcludeSets(session, config);
+
+    expect(session._allowedToolNames.has("read")).toBe(true);
+    expect(session._allowedToolNames.has("bash")).toBe(true);
+    expect(session._allowedToolNames.has("edit")).toBe(true);
   });
 });
