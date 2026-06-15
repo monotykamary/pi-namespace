@@ -218,6 +218,7 @@ interface RegisteredTool {
 }
 
 let patched = false;
+let sessionPatched = false;
 let runnerModule: any = null;
 
 async function findRunnerModule(): Promise<any> {
@@ -308,6 +309,162 @@ async function patchExtensionRunner(config: NamespaceConfig): Promise<boolean> {
 
   patched = true;
   return true;
+}
+
+// --- AgentSession patch ---
+//
+// Built-in tools bypass ExtensionRunner.getAllRegisteredTools() — they're
+// stored in AgentSession._baseToolDefinitions and assembled separately in
+// _refreshToolRegistry. To namespace built-ins, we patch
+// AgentSession.prototype._refreshToolRegistry and post-process the resulting
+// data structures after the original method runs.
+
+let agentSessionModule: any = null;
+
+async function findAgentSessionModule(): Promise<any> {
+  if (agentSessionModule) return agentSessionModule;
+
+  const piDist = findPiDist();
+  if (!piDist) return null;
+
+  try {
+    agentSessionModule = await import(join(piDist, "core/agent-session.js"));
+    return agentSessionModule;
+  } catch {
+    return null;
+  }
+}
+
+async function patchAgentSession(config: NamespaceConfig): Promise<boolean> {
+  if (sessionPatched) return true;
+  // No builtin namespace configured — nothing to patch on the session side.
+  // The ExtensionRunner patch already handles extension tools.
+  if (!config.builtinNamespace) return true;
+
+  const mod = await findAgentSessionModule();
+  if (!mod || !mod.AgentSession) return false;
+
+  const Session = mod.AgentSession;
+  const originalRefresh = Session.prototype._refreshToolRegistry;
+
+  if (typeof originalRefresh !== "function") return false;
+
+  Session.prototype._refreshToolRegistry = function (this: any, ...args: any[]) {
+    originalRefresh.call(this, ...args);
+    rewriteBuiltinTools(this, config);
+  };
+
+  sessionPatched = true;
+  return true;
+}
+
+/**
+ * Post-process an AgentSession's internal data structures to namespace
+ * built-in tools. Called after _refreshToolRegistry completes.
+ *
+ * Built-in tools are stored under their original names in _toolDefinitions,
+ * _toolPromptSnippets, _toolPromptGuidelines, and _toolRegistry. We rename
+ * the keys and update the wrapped tool names so the namespaced versions flow
+ * through to the LLM schema, system prompt, and tool dispatch.
+ *
+ * Extension overrides of built-in tools are NOT renamed — those intentionally
+ * replace the built-in by name, and renaming would break the override.
+ */
+export function rewriteBuiltinTools(session: any, config: NamespaceConfig): void {
+  if (!config.builtinNamespace) return;
+
+  const ns = config.builtinNamespace;
+  const definitions: Map<string, any> = session._toolDefinitions;
+  const snippets: Map<string, string> = session._toolPromptSnippets;
+  const guidelinesMap: Map<string, string[]> = session._toolPromptGuidelines;
+  const registry: Map<string, any> = session._toolRegistry;
+
+  // Collect renames for built-in tools that haven't been overridden by extensions.
+  // An extension override would replace the sourceInfo in _toolDefinitions,
+  // so we only rename entries still marked as source === "builtin".
+  const renames: Array<{ from: string; to: string }> = [];
+  for (const [name, entry] of definitions) {
+    if (entry.sourceInfo?.source === "builtin" && BUILTIN_TOOLS.has(name)) {
+      const namespacedName = applyNamespace(ns, name);
+      if (namespacedName !== name) {
+        renames.push({ from: name, to: namespacedName });
+      }
+    }
+  }
+
+  if (renames.length === 0) return;
+
+  for (const { from, to } of renames) {
+    // 1. Rewrite _toolDefinitions
+    const entry = definitions.get(from);
+    if (entry) {
+      const namespacedDef = Object.create(entry.definition);
+      namespacedDef.name = to;
+
+      if (entry.definition.promptSnippet) {
+        namespacedDef.promptSnippet = entry.definition.promptSnippet.replace(
+          new RegExp(`\\b${escapeRegex(from)}\\b`, "g"),
+          to,
+        );
+      }
+
+      if (entry.definition.promptGuidelines?.length) {
+        namespacedDef.promptGuidelines = entry.definition.promptGuidelines.map(
+          (g: string) =>
+            g.replace(new RegExp(`\\b${escapeRegex(from)}\\b`, "g"), to),
+        );
+      }
+
+      definitions.delete(from);
+      definitions.set(to, {
+        definition: namespacedDef,
+        sourceInfo: entry.sourceInfo,
+      });
+    }
+
+    // 2. Rewrite _toolPromptSnippets
+    const snippet = snippets.get(from);
+    if (snippet) {
+      snippets.delete(from);
+      snippets.set(
+        to,
+        snippet.replace(
+          new RegExp(`\\b${escapeRegex(from)}\\b`, "g"),
+          to,
+        ),
+      );
+    }
+
+    // 3. Rewrite _toolPromptGuidelines
+    const guideline = guidelinesMap.get(from);
+    if (guideline) {
+      guidelinesMap.delete(from);
+      guidelinesMap.set(
+        to,
+        guideline.map((g: string) =>
+          g.replace(new RegExp(`\\b${escapeRegex(from)}\\b`, "g"), to),
+        ),
+      );
+    }
+
+    // 4. Rewrite _toolRegistry
+    const tool = registry.get(from);
+    if (tool) {
+      const namespacedTool = { ...tool, name: to };
+      registry.delete(from);
+      registry.set(to, namespacedTool);
+    }
+  }
+
+  // 5. Re-sync active tool names with the renamed registry.
+  // setActiveToolsByName validates against _toolRegistry, so it will only
+  // activate tools that exist under their new namespaced keys.
+  const activeNames: string[] = session.getActiveToolNames();
+  const updatedNames = activeNames.map((name: string) => {
+    const rename = renames.find((r) => r.from === name);
+    return rename ? rename.to : name;
+  });
+  session.setActiveToolsByName(updatedNames);
 }
 
 /**
@@ -437,10 +594,16 @@ export default async function namespaceExtension(pi: ExtensionAPI) {
   // Build the map after tools are registered
   pi.on("session_start", async (_event, _ctx) => {
     // Patch the runner if not already done
-    const success = await patchExtensionRunner(config);
-    if (!success) {
+    const runnerSuccess = await patchExtensionRunner(config);
+    if (!runnerSuccess) {
       // Couldn't patch — likely running in an environment where the
       // runner module isn't accessible (print mode, etc.)
+    }
+
+    // Patch the AgentSession if builtinNamespace is configured
+    const sessionSuccess = await patchAgentSession(config);
+    if (!sessionSuccess && config.builtinNamespace) {
+      // Couldn't patch — built-in tools won't be namespaced
     }
 
     // Build the reverse namespace map from current tools

@@ -9,6 +9,7 @@ import {
   applyNamespace,
   stripNamespace,
   rewriteTools,
+  rewriteBuiltinTools,
 } from "../../namespace.js";
 import type { NamespaceConfig } from "../../namespace.js";
 
@@ -275,5 +276,177 @@ describe("rewriteTools", () => {
     const result = rewriteTools(tools, config);
     expect(result[0].definition.name).toBe("deploy:push");
     // No promptSnippet or promptGuidelines to rewrite — should not throw
+  });
+});
+
+describe("rewriteBuiltinTools", () => {
+  function makeSession(builtinNames: string[] = ["read", "bash", "edit"]) {
+    const definitions = new Map();
+    const snippets = new Map();
+    const guidelines = new Map();
+    const registry = new Map();
+    const activeNames = [...builtinNames];
+
+    for (const name of builtinNames) {
+      definitions.set(name, {
+        definition: {
+          name,
+          label: name,
+          description: `Built-in ${name}`,
+          promptSnippet: `Use ${name} for file ops`,
+          promptGuidelines: [`Always use ${name} carefully`],
+          execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+        },
+        sourceInfo: {
+          path: `<builtin:${name}>`,
+          source: "builtin",
+          scope: "temporary",
+          origin: "top-level",
+        },
+      });
+
+      snippets.set(name, `Use ${name} for file ops`);
+      guidelines.set(name, [`Always use ${name} carefully`]);
+      registry.set(name, {
+        name,
+        label: name,
+        description: `Built-in ${name}`,
+        execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+      });
+    }
+
+    return {
+      _toolDefinitions: definitions,
+      _toolPromptSnippets: snippets,
+      _toolPromptGuidelines: guidelines,
+      _toolRegistry: registry,
+      getActiveToolNames: () => [...activeNames],
+      setActiveToolsByName: (names: string[]) => {
+        activeNames.length = 0;
+        activeNames.push(...names);
+      },
+    };
+  }
+
+  it("renames built-in tools in all session data structures", () => {
+    const config: NamespaceConfig = { builtinNamespace: "fs" };
+    const session = makeSession(["read", "bash"]);
+
+    rewriteBuiltinTools(session, config);
+
+    // _toolDefinitions
+    expect(session._toolDefinitions.has("read")).toBe(false);
+    expect(session._toolDefinitions.has("bash")).toBe(false);
+    expect(session._toolDefinitions.get("fs:read").definition.name).toBe("fs:read");
+    expect(session._toolDefinitions.get("fs:bash").definition.name).toBe("fs:bash");
+    expect(session._toolDefinitions.get("fs:read").sourceInfo.source).toBe("builtin");
+
+    // _toolPromptSnippets
+    expect(session._toolPromptSnippets.has("read")).toBe(false);
+    expect(session._toolPromptSnippets.get("fs:read")).toBe("Use fs:read for file ops");
+
+    // _toolPromptGuidelines
+    expect(session._toolPromptGuidelines.has("bash")).toBe(false);
+    expect(session._toolPromptGuidelines.get("fs:bash")).toEqual([
+      "Always use fs:bash carefully",
+    ]);
+
+    // _toolRegistry
+    expect(session._toolRegistry.has("read")).toBe(false);
+    expect(session._toolRegistry.get("fs:read").name).toBe("fs:read");
+
+    // Active tool names were re-synced
+    expect(session.getActiveToolNames()).toContain("fs:read");
+    expect(session.getActiveToolNames()).toContain("fs:bash");
+    expect(session.getActiveToolNames()).not.toContain("read");
+  });
+
+  it("does nothing when builtinNamespace is not set", () => {
+    const config: NamespaceConfig = {};
+    const session = makeSession(["read"]);
+
+    rewriteBuiltinTools(session, config);
+
+    expect(session._toolDefinitions.has("read")).toBe(true);
+    expect(session._toolDefinitions.has("fs:read")).toBe(false);
+  });
+
+  it("skips extension overrides of built-in tools", () => {
+    const config: NamespaceConfig = { builtinNamespace: "fs" };
+    const session = makeSession(["read"]);
+
+    // Simulate an extension override: replace the built-in entry with
+    // an extension entry that has source !== "builtin".
+    session._toolDefinitions.set("read", {
+      definition: {
+        name: "read",
+        label: "Enhanced read",
+        description: "Override from extension",
+        execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+      },
+      sourceInfo: {
+        path: "/extensions/pi-code-previews/index.ts",
+        source: "local",
+        scope: "user",
+        origin: "top-level",
+      },
+    });
+
+    rewriteBuiltinTools(session, config);
+
+    // Override should NOT be renamed — it's not from source "builtin"
+    expect(session._toolDefinitions.has("read")).toBe(true);
+    expect(session._toolDefinitions.has("fs:read")).toBe(false);
+  });
+
+  it("rewrites promptSnippet and promptGuidelines to use namespaced name", () => {
+    const config: NamespaceConfig = { builtinNamespace: "fs" };
+    const session = makeSession(["read"]);
+
+    rewriteBuiltinTools(session, config);
+
+    const entry = session._toolDefinitions.get("fs:read");
+    expect(entry.definition.promptSnippet).toBe("Use fs:read for file ops");
+    expect(entry.definition.promptGuidelines).toEqual([
+      "Always use fs:read carefully",
+    ]);
+  });
+
+  it("preserves execute function on wrapped tools in registry", () => {
+    const config: NamespaceConfig = { builtinNamespace: "fs" };
+    const session = makeSession(["read"]);
+    const originalExecute = session._toolRegistry.get("read").execute;
+
+    rewriteBuiltinTools(session, config);
+
+    const wrappedTool = session._toolRegistry.get("fs:read");
+    expect(wrappedTool.execute).toBe(originalExecute);
+  });
+
+  it("is idempotent — calling twice does not double-prefix", () => {
+    const config: NamespaceConfig = { builtinNamespace: "fs" };
+    const session = makeSession(["read"]);
+
+    rewriteBuiltinTools(session, config);
+    rewriteBuiltinTools(session, config);
+
+    // First call renames read → fs:read, second call finds no builtin entries
+    expect(session._toolDefinitions.has("fs:read")).toBe(true);
+    expect(session._toolDefinitions.has("fs:fs:read")).toBe(false);
+  });
+
+  it("handles tools without promptSnippet or promptGuidelines", () => {
+    const config: NamespaceConfig = { builtinNamespace: "fs" };
+    const session = makeSession(["read"]);
+
+    // Remove optional fields
+    const entry = session._toolDefinitions.get("read");
+    delete entry.definition.promptSnippet;
+    delete entry.definition.promptGuidelines;
+
+    expect(() => rewriteBuiltinTools(session, config)).not.toThrow();
+    expect(session._toolDefinitions.get("fs:read").definition.name).toBe(
+      "fs:read",
+    );
   });
 });
