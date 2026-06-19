@@ -1,6 +1,6 @@
 {
   "name": "pi-namespace",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Namespace tools and skills in pi — group tools by extension with configurable prefix rewriting",
   "type": "module",
   "author": "Tom X Nguyen",
@@ -37,7 +37,7 @@
     "lint:dead": "knip --no-gitignore"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.79.1",
+    "@earendil-works/pi-coding-agent": "^0.79.8",
     "@types/node": "25.9.1",
     "@vitest/coverage-v8": "4.1.7",
     "knip": "6.14.1",

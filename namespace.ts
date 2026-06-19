@@ -33,6 +33,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ToolInfo } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
 
 // --- Config ---
 
@@ -53,7 +54,7 @@ const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", 
 
 function loadConfig(cwd: string): NamespaceConfig {
   const candidates = [
-    join(cwd, ".pi", "namespace.json"),
+    join(cwd, CONFIG_DIR_NAME, "namespace.json"),
     join(getAgentDir(), "namespace.json"),
   ];
 
@@ -67,14 +68,6 @@ function loadConfig(cwd: string): NamespaceConfig {
     }
   }
   return {};
-}
-
-// Copied locally to avoid runtime dependency on getAgentDir at module scope.
-// The extension factory passes cwd so this is only used for config loading.
-function getAgentDir(): string {
-  const envDir = process.env.PI_CODING_AGENT_DIR;
-  if (envDir) return envDir;
-  return join(process.env.HOME || "~", ".pi", "agent");
 }
 
 // --- Namespace derivation ---
@@ -251,45 +244,11 @@ async function findRunnerModule(): Promise<any> {
 }
 
 function findPiDist(): string | undefined {
-  // Try to resolve from the current extension's module graph
-  try {
-    const metaUrl = import.meta.url;
-    const metaPath = metaUrl.replace("file://", "");
-    // Walk up from this file to find pi-coding-agent/dist
-    const segments = metaPath.split("/");
-    for (let i = segments.length - 1; i >= 0; i--) {
-      if (
-        segments[i] === "pi-coding-agent" &&
-        segments[i + 1] === "dist"
-      ) {
-        return segments.slice(0, i + 2).join("/");
-      }
-      if (
-        segments[i] === "dist" &&
-        segments[i - 1] === "pi-coding-agent"
-      ) {
-        return segments.slice(0, i + 1).join("/");
-      }
-    }
-  } catch {
-    // Can't resolve from import.meta
-  }
-
-  // Check common install locations
-  const candidates = [
-    join(
-      process.env.HOME || "~",
-      ".npm-global/lib/node_modules/@earendil-works/pi-coding-agent/dist",
-    ),
-    "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist",
-  ];
-
-  for (const d of candidates) {
-    if (existsSync(join(d, "core/extensions/runner.js"))) {
-      return d;
-    }
-  }
-
+  // getPackageDir() resolves pi's own install root and honors PI_PACKAGE_DIR
+  // (Nix/Guix). The runner and agent-session are internal modules not
+  // re-exported from the public API, so import them directly from dist/.
+  const piDist = join(getPackageDir(), "dist");
+  if (existsSync(join(piDist, "core/extensions/runner.js"))) return piDist;
   return undefined;
 }
 
