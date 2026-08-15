@@ -1,6 +1,6 @@
 {
   "name": "pi-namespace",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Namespace tools and skills in pi — group tools by extension with configurable prefix rewriting",
   "type": "module",
   "author": "Tom X Nguyen",
