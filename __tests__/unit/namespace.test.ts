@@ -2,6 +2,9 @@
  * Tests for namespace derivation and resolution logic.
  */
 
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, expect } from "vitest";
 import {
   deriveNamespace,
@@ -11,6 +14,7 @@ import {
   rewriteTools,
   rewriteBuiltinTools,
   expandAllowExcludeSets,
+  discoverBundledRuntimeConstructors,
 } from "../../namespace.js";
 import type { NamespaceConfig } from "../../namespace.js";
 
@@ -457,6 +461,32 @@ describe("rewriteBuiltinTools", () => {
     expect(session._toolDefinitions.get("fs:read").definition.name).toBe(
       "fs:read",
     );
+  });
+});
+
+describe("bundled runtime discovery", () => {
+  it("finds the live runner and session constructor shapes exported by bundle chunks", async () => {
+    const bundleDir = await mkdtemp(join(tmpdir(), "pi-namespace-bundle-"));
+    try {
+      const chunksDir = join(bundleDir, "chunks");
+      await mkdir(chunksDir, { recursive: true });
+      await writeFile(
+        join(chunksDir, "chunk-runtime.js"),
+        [
+          "export class ExtensionRunner { getAllRegisteredTools() { return []; } }",
+          "export class AgentSession { _refreshToolRegistry() {} }",
+          "export class Unrelated {}",
+        ].join("\n"),
+      );
+
+      const discovered = await discoverBundledRuntimeConstructors(bundleDir);
+      expect(discovered.runners).toHaveLength(1);
+      expect(discovered.sessions).toHaveLength(1);
+      expect(typeof discovered.runners[0]?.prototype.getAllRegisteredTools).toBe("function");
+      expect(typeof discovered.sessions[0]?.prototype._refreshToolRegistry).toBe("function");
+    } finally {
+      await rm(bundleDir, { recursive: true, force: true });
+    }
   });
 });
 

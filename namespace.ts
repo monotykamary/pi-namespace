@@ -30,8 +30,9 @@
  * rather than registered definitions.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { ExtensionAPI, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
 
@@ -216,32 +217,69 @@ interface RegisteredTool {
   };
 }
 
+type ExtensionRunnerConstructor = {
+  prototype: {
+    getAllRegisteredTools(): RegisteredTool[];
+  };
+};
+
+type AgentSessionConstructor = {
+  prototype: {
+    _refreshToolRegistry(...args: unknown[]): unknown;
+  };
+};
+
+const isExtensionRunnerConstructor = (value: unknown): value is ExtensionRunnerConstructor =>
+  typeof value === "function" &&
+  typeof (value as { prototype?: unknown }).prototype === "object" &&
+  typeof ((value as { prototype: Record<string, unknown> }).prototype).getAllRegisteredTools ===
+    "function";
+
+const isAgentSessionConstructor = (value: unknown): value is AgentSessionConstructor =>
+  typeof value === "function" &&
+  typeof (value as { prototype?: unknown }).prototype === "object" &&
+  typeof ((value as { prototype: Record<string, unknown> }).prototype)._refreshToolRegistry ===
+    "function";
+
+export async function discoverBundledRuntimeConstructors(bundleDir: string): Promise<{
+  runners: ExtensionRunnerConstructor[];
+  sessions: AgentSessionConstructor[];
+}> {
+  const chunksDir = join(bundleDir, "chunks");
+  if (!existsSync(chunksDir)) return { runners: [], sessions: [] };
+
+  let files: string[];
+  try {
+    files = readdirSync(chunksDir);
+  } catch {
+    return { runners: [], sessions: [] };
+  }
+
+  const runners = new Set<ExtensionRunnerConstructor>();
+  const sessions = new Set<AgentSessionConstructor>();
+  for (const file of files) {
+    if (!file.endsWith(".js")) continue;
+    try {
+      const module = (await import(pathToFileURL(join(chunksDir, file)).href)) as Record<
+        string,
+        unknown
+      >;
+      for (const exported of Object.values(module)) {
+        if (isExtensionRunnerConstructor(exported)) runners.add(exported);
+        if (isAgentSessionConstructor(exported)) sessions.add(exported);
+      }
+    } catch {
+      // Some bundle chunks are worker or native entry points and cannot load here.
+    }
+  }
+  return { runners: [...runners], sessions: [...sessions] };
+}
+
 let patched = false;
 let sessionPatched = false;
-let runnerModule: any = null;
-
-async function findRunnerModule(): Promise<any> {
-  if (runnerModule) return runnerModule;
-
-  // Try importing from the pi coding agent dist
-  try {
-    const mod = await import("@earendil-works/pi-coding-agent");
-    // The runner is not exported directly — we need to find it through the dist
-  } catch {
-    // Not available as import
-  }
-
-  // Find the runner from the installed package
-  const piDist = findPiDist();
-  if (!piDist) return null;
-
-  try {
-    runnerModule = await import(join(piDist, "core/extensions/runner.js"));
-    return runnerModule;
-  } catch {
-    return null;
-  }
-}
+let bundledConstructors:
+  | Promise<{ runners: ExtensionRunnerConstructor[]; sessions: AgentSessionConstructor[] }>
+  | undefined;
 
 function findPiDist(): string | undefined {
   // getPackageDir() resolves pi's own install root and honors PI_PACKAGE_DIR
@@ -252,25 +290,58 @@ function findPiDist(): string | undefined {
   return undefined;
 }
 
+async function findRuntimeConstructors(): Promise<{
+  runners: ExtensionRunnerConstructor[];
+  sessions: AgentSessionConstructor[];
+}> {
+  const piDist = findPiDist();
+  if (!piDist) return { runners: [], sessions: [] };
+
+  const runners = new Set<ExtensionRunnerConstructor>();
+  const sessions = new Set<AgentSessionConstructor>();
+  try {
+    const runnerModule = (await import(join(piDist, "core/extensions/runner.js"))) as Record<
+      string,
+      unknown
+    >;
+    for (const exported of Object.values(runnerModule)) {
+      if (isExtensionRunnerConstructor(exported)) runners.add(exported);
+    }
+  } catch {
+    // The unbundled runtime is optional in standalone distributions.
+  }
+  try {
+    const sessionModule = (await import(join(piDist, "core/agent-session.js"))) as Record<
+      string,
+      unknown
+    >;
+    for (const exported of Object.values(sessionModule)) {
+      if (isAgentSessionConstructor(exported)) sessions.add(exported);
+    }
+  } catch {
+    // The unbundled runtime is optional in standalone distributions.
+  }
+
+  bundledConstructors ??= discoverBundledRuntimeConstructors(join(piDist, "bundle"));
+  const bundled = await bundledConstructors;
+  for (const Runner of bundled.runners) runners.add(Runner);
+  for (const Session of bundled.sessions) sessions.add(Session);
+  return { runners: [...runners], sessions: [...sessions] };
+}
+
 async function patchExtensionRunner(config: NamespaceConfig): Promise<boolean> {
   if (patched) return true;
 
-  const mod = await findRunnerModule();
-  if (!mod || !mod.ExtensionRunner) {
-    return false;
+  const { runners } = await findRuntimeConstructors();
+  if (runners.length === 0) return false;
+
+  for (const Runner of runners) {
+    const originalGetAllRegisteredTools = Runner.prototype.getAllRegisteredTools;
+    Runner.prototype.getAllRegisteredTools = function (this: unknown): RegisteredTool[] {
+      const tools = originalGetAllRegisteredTools.call(this);
+      return rewriteTools(tools, config);
+    };
   }
-
-  const Runner = mod.ExtensionRunner;
-  const originalGetAllRegisteredTools = Runner.prototype.getAllRegisteredTools;
-
-  if (typeof originalGetAllRegisteredTools !== "function") {
-    return false;
-  }
-
-  Runner.prototype.getAllRegisteredTools = function (this: any): RegisteredTool[] {
-    const tools: RegisteredTool[] = originalGetAllRegisteredTools.call(this);
-    return rewriteTools(tools, config);
-  };
 
   patched = true;
   return true;
@@ -284,45 +355,27 @@ async function patchExtensionRunner(config: NamespaceConfig): Promise<boolean> {
 // AgentSession.prototype._refreshToolRegistry and post-process the resulting
 // data structures after the original method runs.
 
-let agentSessionModule: any = null;
-
-async function findAgentSessionModule(): Promise<any> {
-  if (agentSessionModule) return agentSessionModule;
-
-  const piDist = findPiDist();
-  if (!piDist) return null;
-
-  try {
-    agentSessionModule = await import(join(piDist, "core/agent-session.js"));
-    return agentSessionModule;
-  } catch {
-    return null;
-  }
-}
-
 async function patchAgentSession(config: NamespaceConfig): Promise<boolean> {
   if (sessionPatched) return true;
   // No builtin namespace configured — nothing to patch on the session side.
   // The ExtensionRunner patch already handles extension tools.
   if (!config.builtinNamespace) return true;
 
-  const mod = await findAgentSessionModule();
-  if (!mod || !mod.AgentSession) return false;
+  const { sessions } = await findRuntimeConstructors();
+  if (sessions.length === 0) return false;
 
-  const Session = mod.AgentSession;
-  const originalRefresh = Session.prototype._refreshToolRegistry;
-
-  if (typeof originalRefresh !== "function") return false;
-
-  Session.prototype._refreshToolRegistry = function (this: any, ...args: any[]) {
-    // Expand _allowedToolNames / _excludedToolNames so that namespaced forms
-    // (e.g. "fs:read") resolve to their originals ("read") for the
-    // isAllowedTool filter, which runs against pre-rewrite names.
-    // Both directions are added so the filter works at every stage.
-    expandAllowExcludeSets(this, config);
-    originalRefresh.call(this, ...args);
-    rewriteBuiltinTools(this, config);
-  };
+  for (const Session of sessions) {
+    const originalRefresh = Session.prototype._refreshToolRegistry;
+    Session.prototype._refreshToolRegistry = function (this: any, ...args: unknown[]) {
+      // Expand _allowedToolNames / _excludedToolNames so that namespaced forms
+      // (e.g. "fs:read") resolve to their originals ("read") for the
+      // isAllowedTool filter, which runs against pre-rewrite names.
+      // Both directions are added so the filter works at every stage.
+      expandAllowExcludeSets(this, config);
+      originalRefresh.call(this, ...args);
+      rewriteBuiltinTools(this, config);
+    };
+  }
 
   sessionPatched = true;
   return true;
