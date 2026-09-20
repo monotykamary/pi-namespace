@@ -25,6 +25,12 @@ export function createMockPi(): MockPi {
     on(event: string, handler: any) {
       if (!eventHandlers.has(event)) eventHandlers.set(event, []);
       eventHandlers.get(event)!.push(handler);
+      return () => {
+        const list = eventHandlers.get(event);
+        if (!list) return;
+        const idx = list.indexOf(handler);
+        if (idx !== -1) list.splice(idx, 1);
+      };
     },
     registerTool(tool: any): void {
       mock._registeredTools.push(tool.name);
