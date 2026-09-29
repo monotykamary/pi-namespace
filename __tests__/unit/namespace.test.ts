@@ -18,6 +18,23 @@ import {
 } from "../../namespace.js";
 import type { NamespaceConfig } from "../../namespace.js";
 
+it("preserves native exposure, schema and hook self-references when renaming", () => {
+  const parameters = { type: "object", properties: {} };
+  const definition = {
+    name: "gateway", label: "Gateway", description: "Gateway", parameters,
+    exposure: "model-only", outputSchema: { type: "integer" },
+    execute: async () => ({ content: [], structuredContent: 1, details: undefined }),
+    prepareLoadout: () => ({ descriptions: { gateway: "prepared" }, hiddenDeclarations: ["leaf"] }),
+  };
+  const [tool] = rewriteTools([{ definition, sourceInfo: { path: "pi-example", source: "local", scope: "user", origin: "top-level" } }], { namespaces: { "pi-example": "example" }, separator: "__" });
+  expect(tool.definition.name).toBe("example__gateway");
+  expect(tool.definition.exposure).toBe("model-only");
+  expect(tool.definition.namespace).toEqual({ name: "example" });
+  expect(tool.definition.parameters).toBe(parameters);
+  expect(tool.definition.execute).toBe(definition.execute);
+  expect((tool.definition.prepareLoadout as Function)({})).toEqual({ descriptions: { example__gateway: "prepared" }, hiddenDeclarations: ["leaf"] });
+});
+
 describe("deriveNamespace", () => {
   it("derives from npm: source paths", () => {
     expect(deriveNamespace("npm:@foo/pi-deploy")).toBe("deploy");
@@ -201,6 +218,12 @@ describe("rewriteTools", () => {
     expect(result[0].definition.promptGuidelines).toEqual([
       "Use deploy:push when needed",
     ]);
+  });
+
+  it("never namespaces an extension builtin override, even with explicit mappings", () => {
+    const tool = makeTool("read", "local", "pi-preview");
+    const config = { namespaces: { "pi-preview": "preview" }, builtinNamespace: "fs" };
+    expect(rewriteTools([tool], config)[0]).toBe(tool);
   });
 
   it("rewrites built-in tools when builtinNamespace is set", () => {

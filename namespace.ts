@@ -34,7 +34,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ExtensionAPI, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { CONFIG_DIR_NAME, getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
+import { AgentSession, CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 // --- Config ---
 
@@ -51,7 +51,7 @@ export interface NamespaceConfig {
   separator?: string;
 }
 
-const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+const BUILTIN_TOOLS = new Set(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]);
 
 function loadConfig(cwd: string): NamespaceConfig {
   const candidates = [
@@ -118,7 +118,7 @@ export function deriveNamespace(extPath: string): string | null {
  * Find a matching namespace for a tool based on its sourceInfo.path and the config.
  */
 export function resolveNamespace(
-  tool: ToolInfo,
+  tool: Pick<ToolInfo, "name" | "sourceInfo">,
   config: NamespaceConfig,
 ): string | null {
   // Built-in tools
@@ -275,106 +275,70 @@ export async function discoverBundledRuntimeConstructors(bundleDir: string): Pro
   return { runners: [...runners], sessions: [...sessions] };
 }
 
-let patched = false;
 let sessionPatched = false;
-let bundledConstructors:
-  | Promise<{ runners: ExtensionRunnerConstructor[]; sessions: AgentSessionConstructor[] }>
-  | undefined;
 
-function findPiDist(): string | undefined {
-  // getPackageDir() resolves pi's own install root and honors PI_PACKAGE_DIR
-  // (Nix/Guix). The runner and agent-session are internal modules not
-  // re-exported from the public API, so import them directly from dist/.
-  const piDist = join(getPackageDir(), "dist");
-  if (existsSync(join(piDist, "core/extensions/runner.js"))) return piDist;
-  return undefined;
-}
-
-async function findRuntimeConstructors(): Promise<{
-  runners: ExtensionRunnerConstructor[];
-  sessions: AgentSessionConstructor[];
-}> {
-  const piDist = findPiDist();
-  if (!piDist) return { runners: [], sessions: [] };
-
-  const runners = new Set<ExtensionRunnerConstructor>();
-  const sessions = new Set<AgentSessionConstructor>();
-  try {
-    const runnerModule = (await import(join(piDist, "core/extensions/runner.js"))) as Record<
-      string,
-      unknown
-    >;
-    for (const exported of Object.values(runnerModule)) {
-      if (isExtensionRunnerConstructor(exported)) runners.add(exported);
-    }
-  } catch {
-    // The unbundled runtime is optional in standalone distributions.
-  }
-  try {
-    const sessionModule = (await import(join(piDist, "core/agent-session.js"))) as Record<
-      string,
-      unknown
-    >;
-    for (const exported of Object.values(sessionModule)) {
-      if (isAgentSessionConstructor(exported)) sessions.add(exported);
-    }
-  } catch {
-    // The unbundled runtime is optional in standalone distributions.
-  }
-
-  bundledConstructors ??= discoverBundledRuntimeConstructors(join(piDist, "bundle"));
-  const bundled = await bundledConstructors;
-  for (const Runner of bundled.runners) runners.add(Runner);
-  for (const Session of bundled.sessions) sessions.add(Session);
-  return { runners: [...runners], sessions: [...sessions] };
-}
-
-async function patchExtensionRunner(config: NamespaceConfig): Promise<boolean> {
-  if (patched) return true;
-
-  const { runners } = await findRuntimeConstructors();
-  if (runners.length === 0) return false;
-
-  for (const Runner of runners) {
-    const originalGetAllRegisteredTools = Runner.prototype.getAllRegisteredTools;
-    Runner.prototype.getAllRegisteredTools = function (this: unknown): RegisteredTool[] {
-      const tools = originalGetAllRegisteredTools.call(this);
-      return rewriteTools(tools, config);
-    };
-  }
-
-  patched = true;
-  return true;
+function patchRunnerPrototype(prototype: ExtensionRunnerConstructor["prototype"], config: NamespaceConfig): void {
+  const original = prototype.getAllRegisteredTools;
+  if (typeof original !== "function") throw new Error("Unsupported Pi runner registry shape");
+  const marker = Symbol.for("pi-namespace.runner.v2");
+  if ((original as any)[marker]) return;
+  prototype.getAllRegisteredTools = function (this: { cwd?: string }): RegisteredTool[] {
+    return rewriteTools(original.call(this), this.cwd ? loadConfig(this.cwd) : config);
+  };
+  Object.defineProperty(prototype.getAllRegisteredTools, marker, { value: true });
 }
 
 // --- AgentSession patch ---
 //
 // Built-in tools bypass ExtensionRunner.getAllRegisteredTools() — they're
 // stored in AgentSession._baseToolDefinitions and assembled separately in
-// _refreshToolRegistry. To namespace built-ins, we patch
-// AgentSession.prototype._refreshToolRegistry and post-process the resulting
-// data structures after the original method runs.
+// _refreshToolRegistry. Rename base definitions before the native method wraps
+// them, so loadout hooks and nested tool events share the registered names.
 
 async function patchAgentSession(config: NamespaceConfig): Promise<boolean> {
   if (sessionPatched) return true;
-  // No builtin namespace configured — nothing to patch on the session side.
-  // The ExtensionRunner patch already handles extension tools.
-  if (!config.builtinNamespace) return true;
 
-  const { sessions } = await findRuntimeConstructors();
-  if (sessions.length === 0) return false;
+  // The public import is mapped by Pi to its live SDK OR bundled constructor.
+  const sessions = [AgentSession as unknown as AgentSessionConstructor];
+  if (!isAgentSessionConstructor(AgentSession)) return false;
 
   for (const Session of sessions) {
     const originalRefresh = Session.prototype._refreshToolRegistry;
+    if ((originalRefresh as any)[Symbol.for("pi-namespace.session.v2")]) continue;
     Session.prototype._refreshToolRegistry = function (this: any, ...args: unknown[]) {
-      // Expand _allowedToolNames / _excludedToolNames so that namespaced forms
-      // (e.g. "fs:read") resolve to their originals ("read") for the
-      // isAllowedTool filter, which runs against pre-rewrite names.
-      // Both directions are added so the filter works at every stage.
-      expandAllowExcludeSets(this, config);
-      originalRefresh.call(this, ...args);
-      rewriteBuiltinTools(this, config);
+      const local = this._cwd ? loadConfig(this._cwd) : config;
+      patchRunnerPrototype(Object.getPrototypeOf(this._extensionRunner), local);
+      if (!local.builtinNamespace) return originalRefresh.apply(this, args);
+      expandAllowExcludeSets(this, local);
+      const base = this._baseToolDefinitions;
+      const overrides = new Set([
+        ...this._extensionRunner.getAllRegisteredTools().map((tool: RegisteredTool) => tool.definition.name),
+        ...this._customTools.map((tool: { name: string }) => tool.name),
+      ]);
+      const rename = (name: string) => BUILTIN_TOOLS.has(name) && !overrides.has(name)
+        ? applyNamespace(local.builtinNamespace!, name, local.separator ?? ":") : name;
+      // Rename BEFORE native wrapping. Its closures must see the same name as
+      // ctx.tools, nested-call events, exposure lookup and loadout preparation.
+      this._baseToolDefinitions = new Map([...base].map(([name, definition]: [string, any]) => {
+        const renamed = Object.create(definition);
+        renamed.name = rename(name);
+        if (renamed.name !== name) {
+          renamed.namespace = definition.namespace ?? { name: local.builtinNamespace };
+          if (definition.promptSnippet) renamed.promptSnippet = definition.promptSnippet.replace(new RegExp(`\\b${escapeRegex(name)}\\b`, "g"), renamed.name);
+          if (definition.promptGuidelines) renamed.promptGuidelines = definition.promptGuidelines.map((text: string) => text.replace(new RegExp(`\\b${escapeRegex(name)}\\b`, "g"), renamed.name));
+        }
+        return [renamed.name, renamed];
+      }));
+      const options = args[0] as { activeToolNames?: string[] } | undefined;
+      const forwarded = options?.activeToolNames
+        ? [{ ...options, activeToolNames: options.activeToolNames.map(rename) }, ...args.slice(1)] : args;
+      try {
+        return originalRefresh.apply(this, forwarded);
+      } finally {
+        this._baseToolDefinitions = base;
+      }
     };
+    Object.defineProperty(Session.prototype._refreshToolRegistry, Symbol.for("pi-namespace.session.v2"), { value: true });
   }
 
   sessionPatched = true;
@@ -539,12 +503,11 @@ export function rewriteTools(
   config: NamespaceConfig,
 ): RegisteredTool[] {
   return tools.map((tool) => {
+    // An extension's read/bash/etc. is an override, not an additional tool.
+    if (BUILTIN_TOOLS.has(tool.definition.name) && tool.sourceInfo.source !== "builtin") return tool;
     const ns = resolveNamespace(
       {
         name: tool.definition.name,
-        description: tool.definition.description,
-        parameters: (tool.definition as any).parameters,
-        promptGuidelines: tool.definition.promptGuidelines,
         sourceInfo: tool.sourceInfo,
       },
       config,
@@ -555,19 +518,26 @@ export function rewriteTools(
     const sep = config.separator ?? ":";
     const namespacedName = applyNamespace(ns, tool.definition.name, sep);
 
-    // Don't rewrite built-in tool overrides — those intentionally replace the
-    // built-in by name. If the extension that provides the override has a
-    // namespace, it would break the override mechanism.
-    // We only namespace if the tool name differs from a built-in OR if the
-    // user explicitly set builtinNamespace.
-    if (BUILTIN_TOOLS.has(tool.definition.name) && !config.builtinNamespace) {
-      // This is a built-in tool being listed — only namespace if builtinNamespace is set
-      if (tool.sourceInfo.source === "builtin") return tool;
-    }
-
     // Create a delegating object that overrides only the name-related fields
     const namespacedDef = Object.create(tool.definition) as typeof tool.definition;
     namespacedDef.name = namespacedName;
+    namespacedDef.namespace = tool.definition.namespace ?? { name: ns };
+    // Hooks often return their own description under the original tool name.
+    // Preserve their native callable/registered loadout and translate only that
+    // self-reference; other tool names already come from the supplied loadout.
+    const prepare = tool.definition.prepareLoadout;
+    if (typeof prepare === "function") {
+      namespacedDef.prepareLoadout = (loadout: unknown) => {
+        const changes = prepare.call(tool.definition, loadout);
+        if (!changes) return changes;
+        const descriptions = changes.descriptions ? { ...changes.descriptions } : undefined;
+        if (descriptions && tool.definition.name in descriptions) {
+          descriptions[namespacedName] = descriptions[tool.definition.name];
+          delete descriptions[tool.definition.name];
+        }
+        return { ...changes, descriptions, hiddenDeclarations: changes.hiddenDeclarations?.map((name: string) => name === tool.definition.name ? namespacedName : name) };
+      };
+    }
 
     // Rewrite prompt snippets and guidelines to use the namespaced name
     if (tool.definition.promptSnippet) {
@@ -658,7 +628,6 @@ export default async function namespaceExtension(pi: ExtensionAPI) {
   // The factory runs during _buildRuntime, before _refreshToolRegistry is
   // called for the first time. If we defer to session_start, the first
   // _refreshToolRegistry call will use the unpatched prototype.
-  await patchExtensionRunner(config);
   await patchAgentSession(config);
 
   // Build the map after tools are registered
