@@ -34,7 +34,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ExtensionAPI, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { AgentSession, CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { AgentSession, CONFIG_DIR_NAME, formatSkillsForPrompt, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 // --- Config ---
 
@@ -615,6 +615,12 @@ function rewriteSkillPrompt(systemPrompt: string, config: NamespaceConfig): stri
   return result;
 }
 
+function localBuiltinReader(selectedTools: string[], config: NamespaceConfig): string | undefined {
+  if (!config.builtinNamespace) return undefined;
+  return ["read", "bash"].map((name) => applyNamespace(config.builtinNamespace!, name, config.separator ?? ":"))
+    .find((name) => selectedTools.includes(name));
+}
+
 // --- Extension entry ---
 
 export default async function namespaceExtension(pi: ExtensionAPI) {
@@ -631,7 +637,8 @@ export default async function namespaceExtension(pi: ExtensionAPI) {
   await patchAgentSession(config);
 
   // Build the map after tools are registered
-  pi.on("session_start", async (_event, _ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
+    const config = loadConfig(ctx?.cwd ?? cwd);
     // Build the reverse namespace map from current tools
     const tools = pi.getAllTools();
     const sep = config.separator ?? ":";
@@ -646,11 +653,33 @@ export default async function namespaceExtension(pi: ExtensionAPI) {
   });
 
   // Rewrite skill names in the system prompt
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    const config = loadConfig(ctx?.cwd ?? cwd);
     if (Object.keys(config.namespaces ?? {}).length === 0 && !config.builtinNamespace) {
       return;
     }
 
+    // Pi 1.0 renders skills as <skill><name>...</name></skill>. Transform
+    // structured metadata instead of forcing an opaque system prompt, so
+    // subsequent tool/prompt deltas and compaction checkpoints stay coherent.
+    if (event.systemPromptOptions) {
+      event.systemPromptOptions.skills = event.systemPromptOptions.skills.map((skill) => {
+        const mapping = Object.entries(config.namespaces ?? {}).find(([key]) => skill.name.startsWith(key));
+        return {
+          ...skill,
+          name: mapping ? applyNamespace(mapping[1], skill.name, config.separator ?? ":") : skill.name,
+          description: rewriteSkillPrompt(skill.description, config),
+        };
+      });
+      // Host skill rendering recognizes only literal read/bash. Once builtins
+      // are renamed, supply the same skill section via the public section API.
+      const options = event.systemPromptOptions;
+      const reader = localBuiltinReader(options.selectedTools, config);
+      if (reader && !options.selectedTools.some((name) => name === "read" || name === "bash")) {
+        options.sections.skills = formatSkillsForPrompt(options.skills).replace("Use the read tool", `Use the ${reader} tool`);
+      }
+      return;
+    }
     const rewritten = rewriteSkillPrompt(event.systemPrompt, config);
     if (rewritten !== event.systemPrompt) {
       return { systemPrompt: rewritten };
@@ -667,6 +696,7 @@ export default async function namespaceExtension(pi: ExtensionAPI) {
         .map((s) => ({ value: s, label: s }));
     },
     handler: async (args, ctx) => {
+      const config = loadConfig(ctx.cwd);
       const subcommand = args?.trim();
 
       if (subcommand === "config") {

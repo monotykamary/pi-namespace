@@ -1,5 +1,5 @@
-// Offline Pi 0.99 load/lifecycle + native nested-tool/loadout regression.
-// PI99_HOST_PACKAGE may point at the installed host rather than local dev deps.
+// Offline Pi 1.0 load/lifecycle + native nested-tool/loadout regression.
+// PI1_HOST_PACKAGE may point at the installed host rather than local dev deps.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { findPackageJSON } from 'node:module';
@@ -8,44 +8,48 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'));
-const scratch = resolve(process.env.PI99_SCRATCH ?? join(repo, '.tmp'));
+const scratch = resolve(process.env.PI1_SCRATCH ?? join(repo, '.tmp'));
 mkdirSync(scratch, { recursive: true });
-const root = mkdtempSync(join(scratch, 'pi99-'));
+const root = mkdtempSync(join(scratch, 'pi1-'));
 const agentDir = join(root, 'agent');
 mkdirSync(agentDir);
 mkdirSync(join(root, '.pi'));
 process.env.PI_CODING_AGENT_DIR = agentDir;
-const host = process.env.PI99_HOST_PACKAGE;
-const hostEntry = process.env.PI99_HOST_ENTRY === 'bundle' ? 'dist/bundle/index.js' : 'dist/index.js';
+const host = process.env.PI1_HOST_PACKAGE;
+const hostEntry = process.env.PI1_HOST_ENTRY === 'bundle' ? 'dist/bundle/index.js' : 'dist/index.js';
 const sdk = await import(host ? pathToFileURL(join(host, hostEntry)).href : '@earendil-works/pi-coding-agent');
 const localSdkUrl = import.meta.resolve('@earendil-works/pi-coding-agent');
 const localSdk = await import(localSdkUrl);
-assert.equal(localSdk.VERSION, '0.99.0', 'resolved development SDK VERSION');
-assert.equal(sdk.VERSION, '0.99.0', 'executing host VERSION');
+assert.equal(localSdk.VERSION, '1.0.0', 'resolved development SDK VERSION');
+assert.equal(sdk.VERSION, '1.0.0', 'executing host VERSION');
 const typeboxPackage = findPackageJSON('typebox', pathToFileURL(join(sdk.getPackageDir(), 'package.json')));
 assert.equal(JSON.parse(readFileSync(typeboxPackage, 'utf8')).version, '1.3.27');
 const aiPackage = findPackageJSON('@earendil-works/pi-ai/compat', pathToFileURL(join(sdk.getPackageDir(), 'package.json')));
 const aiManifest = JSON.parse(readFileSync(aiPackage, 'utf8'));
-assert.equal(aiManifest.version, '0.99.0');
+assert.equal(aiManifest.version, '1.0.0');
 const aiUrl = pathToFileURL(join(dirname(aiPackage), aiManifest.exports['./compat'].import)).href;
 const ai = await import(aiUrl);
 const { fauxProvider, fauxAssistantMessage, fauxToolCall, getCurrentTools } = ai;
 
-test('0.99: load, declarations, native nested validation/results, refresh and shutdown', { timeout: 30000 }, async () => {
-  assert.equal(JSON.parse(readFileSync(join(sdk.getPackageDir(), 'package.json'), 'utf8')).version, '0.99.0');
-  if (manifest.name === 'pi-namespace') writeFileSync(join(root, '.pi/namespace.json'), JSON.stringify({ builtinNamespace: 'fs', separator: '__' }));
+test('1.0: load, declarations, native nested validation/results, refresh and shutdown', { timeout: 30000 }, async () => {
+  assert.equal(JSON.parse(readFileSync(join(sdk.getPackageDir(), 'package.json'), 'utf8')).version, '1.0.0');
+  if (manifest.name === 'pi-namespace') writeFileSync(join(root, '.pi/namespace.json'), JSON.stringify({ builtinNamespace: 'fs', separator: '__', namespaces: { 'probe-skill': 'owned', 'identity.ts': 'owned' } }));
   const settingsManager = sdk.SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, defaultTools: ['+codemode'] });
-  const faux = fauxProvider({ provider: 'pi99-offline', api: 'pi99-offline-api', models: [{ id: 'test', name: 'Offline test', reasoning: false }], tokenSize: { min: 100, max: 100 } });
+  const faux = fauxProvider({ provider: 'pi1-offline', api: 'pi1-offline-api', models: [{ id: 'test', name: 'Offline test', reasoning: false }], tokenSize: { min: 100, max: 100 } });
   const modelRuntime = await sdk.ModelRuntime.create({ authPath: join(agentDir, 'auth.json'), modelsPath: null, refreshOnCreate: false });
   modelRuntime.registerNativeProvider(faux.provider);
   await modelRuntime.refresh({ allowNetwork: false });
   const identityPath = join(root, 'identity.ts');
-  globalThis[Symbol.for('pi99.host.identity')] = { AgentSession: sdk.AgentSession, Type: ai.Type };
+  globalThis[Symbol.for('pi1.host.identity')] = { AgentSession: sdk.AgentSession, Type: ai.Type };
   writeFileSync(identityPath, `import { AgentSession } from '@earendil-works/pi-coding-agent';
 import { Type } from '@earendil-works/pi-ai';
 import { Type as TypeboxType } from 'typebox';
-export default function () {
- const expected = globalThis[Symbol.for('pi99.host.identity')];
+export default function (pi) {
+ pi.registerTool({ name: 'gateway', label: 'Gateway', description: 'Unprepared gateway', exposure: 'model-only',
+   parameters: { type: 'object', properties: {} }, promptGuidelines: ['Use gateway for the offline test.'],
+   prepareLoadout: () => ({ descriptions: { gateway: 'Prepared namespaced gateway' } }),
+   execute: async () => ({ content: [{ type: 'text', text: 'namespaced gateway executed' }], details: undefined }) });
+ const expected = globalThis[Symbol.for('pi1.host.identity')];
  if (AgentSession !== expected.AgentSession || Type !== TypeboxType) throw new Error('Duplicate host module identity');
 }`);
   const events = [], calls = [], errors = [];
@@ -53,6 +57,7 @@ export default function () {
   const readName = manifest.name === 'pi-namespace' ? 'fs__read' : 'read';
   const loader = new sdk.DefaultResourceLoader({ cwd: root, agentDir, settingsManager,
     noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+    skillsOverride: () => ({ skills: [{ name: 'probe-skill', description: 'Use /skill:probe-skill', filePath: identityPath, baseDir: root, sourceInfo: sdk.createSyntheticSourceInfo(identityPath, { source: 'sdk' }), disableModelInvocation: false }], diagnostics: [] }),
     additionalExtensionPaths: [...manifest.pi.extensions.map(p => resolve(repo, p)), identityPath],
     extensionFactories: [sdk.createCodemodeExtension({ mode: 'only', models: false }), pi => {
       api = pi;
@@ -81,7 +86,7 @@ export default function () {
   try {
     await loader.reload();
     assert.deepEqual(loader.getExtensions().errors, []);
-    ({ session } = await sdk.createAgentSession({ cwd: root, agentDir, modelRuntime, model: modelRuntime.getModel('pi99-offline', 'test'), resourceLoader: loader, settingsManager, sessionManager: sdk.SessionManager.inMemory(root) }));
+    ({ session } = await sdk.createAgentSession({ cwd: root, agentDir, modelRuntime, model: modelRuntime.getModel('pi1-offline', 'test'), resourceLoader: loader, settingsManager, sessionManager: sdk.SessionManager.inMemory(root) }));
     session.extensionRunner.onError(e => errors.push(e));
     await session.bindExtensions({});
     const registered = loader.getExtensions().extensions;
@@ -98,14 +103,22 @@ export default function () {
     assert(!session.getActiveToolNames().includes('probe_echo'));
     assert(!session.getCallableToolNames().includes('late_probe'));
     faux.setResponses([ctx => {
+      const prompt = ai.getCurrentSystemPrompt(ctx.messages);
+      assert(prompt.includes('<name>owned__probe-skill</name>'), 'current skill XML is renamed using the session cwd, not process cwd');
+      assert(prompt.includes('/skill:owned__probe-skill'));
+      const checkpoint = ctx.messages.find(m => m.role === 'system');
+      assert(checkpoint.sections, 'structured prompt checkpoint is preserved');
       const names = getCurrentTools(ctx.messages).map(t => t.name);
       assert(names.includes('fabric_exec'));
+      assert.equal(getCurrentTools(ctx.messages).find(t => t.name === 'owned__gateway')?.description, 'Prepared namespaced gateway');
+      assert(prompt.includes('Use owned__gateway for the offline test.'));
+      assert(!session.getCallableToolNames().includes('owned__gateway'));
       assert(!names.includes(readName), 'Fabric/native codemode must hide declarations, not callable tools');
       assert(!names.includes('probe_echo'));
       return fauxAssistantMessage([fauxToolCall('fabric_exec', {}, { id: 'outer' })], { stopReason: 'toolUse' });
     }, fauxAssistantMessage('done')]);
     await session.prompt('offline nested probe');
-    assert.equal(session.getLastAssistantText(), 'done');
+    assert.equal(session.getLastAssistantText(), 'done', JSON.stringify(session.messages.at(-1)));
     assert.deepEqual(calls, [{ value: 7 }]);
     assert(events.some(e => e.type === 'tool_result' && e.parentToolCallId === 'outer' && e.toolCallId === 'outer/1'));
     assert(!session.messages.some(m => m.role === 'toolResult' && m.toolName === 'probe_echo'), 'nested calls do not enter transcript');
@@ -127,6 +140,9 @@ export default function () {
       assert.equal(session.getLastAssistantText(), 'continued');
       assert.equal(session.messages.filter(m => m.role === 'user').length, users);
     }
+    faux.setResponses([fauxAssistantMessage([fauxToolCall('owned__gateway', {}, { id: 'renamed-gateway' })], { stopReason: 'toolUse' }), fauxAssistantMessage('gateway-done')]);
+    await session.prompt('execute rewritten extension gateway');
+    assert.equal(session.messages.find(m => m.role === 'toolResult' && m.toolCallId === 'renamed-gateway')?.isError, false);
     api.registerTool({ name: 'read', label: 'Override read', description: 'Override', parameters: { type: 'object', properties: {} }, execute: async () => ({ content: [{ type: 'text', text: 'override' }], details: undefined }) });
     assert(session.getActiveToolNames().includes('read'), 'explicit builtin override remains authoritative');
     assert(!session.getActiveToolNames().includes('fs__read'), 'do not retain the original builtin beside its override');
@@ -137,7 +153,7 @@ export default function () {
     assert.throws(() => api.getActiveTools(), /stale|inactive|invalid/i);
     await loader.reload();
     assert.deepEqual(loader.getExtensions().errors, []);
-    ({ session } = await sdk.createAgentSession({ cwd: root, agentDir, modelRuntime, model: modelRuntime.getModel('pi99-offline', 'test'), resourceLoader: loader, settingsManager, sessionManager: sdk.SessionManager.inMemory(root) }));
+    ({ session } = await sdk.createAgentSession({ cwd: root, agentDir, modelRuntime, model: modelRuntime.getModel('pi1-offline', 'test'), resourceLoader: loader, settingsManager, sessionManager: sdk.SessionManager.inMemory(root) }));
     await session.bindExtensions({});
     assert(session.getActiveToolNames().includes(readName), 'reload preserves the loadout');
     assert(!session.getActiveToolNames().includes('probe_echo'));

@@ -13,13 +13,13 @@ _Group tools by extension with configurable prefix rewriting — flat tool names
 
 ---
 
-## Pi 0.99 compatibility (0.2.12)
+## Pi 1.0 compatibility (0.2.13)
 
-Tested with Pi **0.99.0**. Host-provided Pi packages and TypeBox are peers (`*`), not bundled runtime dependencies; development uses exact Pi 0.99.0 pins and host-compatible TypeBox where needed.
+Tested with Pi **1.0.0**. Host-provided Pi packages and TypeBox are peers (`*`), not bundled runtime dependencies; development uses exact Pi 1.0.0 pins and host-compatible TypeBox where needed.
 
 Builtin names are rewritten before native wrapping so nested events, callable tools and loadout hooks agree. Native exposure/schema metadata is preserved, hook self-descriptions are renamed, and explicit builtin overrides stay authoritative. Prototype hooks are reload-idempotent and bind to Pi's public mapped `AgentSession`, capturing its actual runner in both SDK and bundled CLI hosts.
 
-Run `bun run test:host` for the offline real-host load, native codemode/nested-call, module-identity and reload checks. Set `PI99_HOST_PACKAGE` to an installed Pi package directory to test that host explicitly; add `PI99_HOST_ENTRY=bundle` to check the bundled CLI runtime's constructors.
+Run `bun run test:host` for the offline real-host load, native codemode/nested-call, module-identity and reload checks. Set `PI1_HOST_PACKAGE` to an installed Pi package directory to test that host explicitly; add `PI1_HOST_ENTRY=bundle` to check the bundled CLI runtime's constructors.
 
 ## The Problem
 
@@ -177,7 +177,7 @@ When `autoNamespace` is `true`, tools from extensions without an explicit mappin
 
 ## How It Works
 
-Hooks install during the factory, before the first registry refresh. In Pi 0.99, builtin definitions are renamed **before** native wrapping; exposure, native namespace grouping, nested events and `prepareLoadout` are preserved. `session_start` builds the diagnostic reverse map. The outline below shows the extension-tool path.
+Hooks install during the factory, before the first registry refresh. In Pi 1.0, builtin definitions are renamed **before** native wrapping; exposure, native namespace grouping, nested events and `prepareLoadout` are preserved. `session_start` builds the diagnostic reverse map. Skills use Pi's public structured prompt metadata and sections, including the renamed builtin reader; configuration follows the session cwd rather than the host process cwd. The outline below shows the extension-tool path.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -261,7 +261,7 @@ This means the original `execute` function runs with zero wrapping overhead. No 
 |------------|---------|
 | **Built-in type guards break** | `isToolCallEventType("bash", event)` won't match `fs:bash`. Use `stripNamespace()` to resolve back to `bash`. |
 | **Tool override by name** | Registering `shell:bash` won't override built-in `bash` since the names differ. |
-| **Fragile to pi internals** | The guarded runner and AgentSession registry hooks target the verified 0.99 Node layout. Future versions or standalone bundles need revalidation. |
+| **Fragile to pi internals** | The guarded runner and AgentSession registry hooks target the verified 1.0 Node layout. Future versions or standalone bundles need revalidation. |
 | **Skill namespacing is prompt-only** | Skills are XML text in the system prompt — we rewrite `<skill name>` attributes but can't intercept `/skill:ns:name` invocations. |
 
 ---
